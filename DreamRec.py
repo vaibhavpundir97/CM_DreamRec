@@ -47,6 +47,8 @@ def parse_args():
     parser.add_argument('--cuda', type=int, default=0, help='CUDA device')
     parser.add_argument('--dropout_rate', type=float,
                         default=0.1, help='Dropout rate')
+    parser.add_argument('--w', type=float, default=2.0,
+                        help='Guidance strength')
     parser.add_argument('--p', type=float, default=0.1,
                         help='Masking probability')
     parser.add_argument('--report_epoch', action='store_true',
@@ -109,8 +111,9 @@ class DiffusionSchedule:
     Provides q_sample and one-step sampling for consistency models.
     """
 
-    def __init__(self, timesteps, beta_start, beta_end, beta_sche='exp'):
+    def __init__(self, timesteps, w, beta_start, beta_end, beta_sche='exp'):
         self.timesteps = timesteps
+        self.w = w
         if beta_sche == 'linear':
             self.betas = linear_beta_schedule(timesteps, beta_start, beta_end)
         elif beta_sche == 'cosine':
@@ -130,12 +133,14 @@ class DiffusionSchedule:
         b_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
         return a_t * x_start + b_t * noise
 
-    def sample(self, model, h, device):
+    def sample(self, model_fw, model_fw_uncond, h, device):
         # one-step sampling: start from pure Gaussian noise at highest level
         x = torch.randn_like(h).to(device)
         t = torch.full((h.shape[0],), self.timesteps-1,
                        device=device, dtype=torch.long)
-        return model(x, h, t)
+        cond = model_fw(x, h, t)
+        uncond = model_fw_uncond(x, t)
+        return (1 + self.w) * cond - self.w * uncond
 
 
 class SinusoidalPositionEmbeddings(nn.Module):
@@ -193,6 +198,17 @@ class Tenc(nn.Module):
     def forward(self, x, h, step):
         t = self.step_mlp(step)
         return self.diffuser(torch.cat((x, h, t), dim=1))
+    
+    def forward_uncond(self, x, step):
+        """
+        Unconditional branch: use a dummy guidance embedding.
+        """
+        B = x.shape[0]
+        h = self.none_embedding(torch.zeros(B, dtype=torch.long, device=self.device))
+        t = self.step_mlp(step.float().unsqueeze(1)).squeeze(1)
+        combined = torch.cat((x, h, t), dim=1)
+        out = self.diffuser(combined)
+        return out
 
     def cacu_x(self, x):
         return self.item_embeddings(x)
@@ -221,7 +237,7 @@ class Tenc(nn.Module):
     def predict(self, states, len_states, diff):
         h = self.cacu_h(states, len_states, p=0.0)
         # one-step sampling
-        x0 = diff.sample(self, h, self.device)
+        x0 = diff.sample(self.forward, self.forward_uncond, h, self.device)
         emb = self.item_embeddings.weight  # (item_num+1, hidden_size)
         scores = torch.matmul(x0, emb.T)
         return scores
@@ -271,7 +287,7 @@ if __name__ == '__main__':
     model = Tenc(args.hidden_factor, item_num, seq_size,
                  args.dropout_rate, args.diffuser_type, device)
     diff = DiffusionSchedule(
-        args.timesteps, args.beta_start, args.beta_end, args.beta_sche)
+        args.timesteps, args.w, args.beta_start, args.beta_end, args.beta_sche)
     model.to(device)
 
     if args.load_model_num:
